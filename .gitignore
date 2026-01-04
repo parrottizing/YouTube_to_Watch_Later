@@ -1,0 +1,19 @@
+# Built files
+/build/
+/app/build/
+*.apk
+*.aab
+
+# Local configuration
+local.properties
+
+# IDE
+.idea/
+*.iml
+.gradle/
+
+# OS
+.DS_Store
+
+# Logs
+*.log
