@@ -1,35 +1,42 @@
 package com.youtubetowatch
 
 import android.accessibilityservice.AccessibilityService
+import android.content.Intent
+import android.content.SharedPreferences
+import android.net.Uri
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 
 /**
- * Accessibility Service that detects when YouTube app is opened.
- * In Phase 1, it shows an overlay popup when YouTube is detected.
- * In Phase 2, it will redirect to Watch Later playlist.
+ * Accessibility Service that detects when YouTube app is opened
+ * and redirects to the Watch Later playlist.
  */
 class YouTubeDetectorService : AccessibilityService() {
 
     companion object {
         private const val TAG = "YouTubeDetector"
         private const val YOUTUBE_PACKAGE = "com.google.android.youtube"
+        private const val WATCH_LATER_URL = "https://www.youtube.com/playlist?list=WL"
         
-        // Cooldown to prevent multiple triggers
-        private const val COOLDOWN_MS = 3000L
+        // Cooldown to prevent redirect loops (5 seconds)
+        private const val COOLDOWN_MS = 5000L
+        
+        // Preference keys
+        private const val PREFS_NAME = "youtube_redirect_prefs"
+        private const val PREF_ENABLED = "redirect_enabled"
         
         var isServiceEnabled = false
             private set
     }
 
-    private var lastTriggerTime = 0L
-    private var overlayManager: OverlayManager? = null
+    private var lastRedirectTime = 0L
+    private var prefs: SharedPreferences? = null
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         isServiceEnabled = true
-        overlayManager = OverlayManager(this)
-        Log.d(TAG, "Service connected - YouTube detection enabled")
+        prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        Log.d(TAG, "Service connected - YouTube redirect enabled")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -46,32 +53,36 @@ class YouTubeDetectorService : AccessibilityService() {
         if (packageName == YOUTUBE_PACKAGE) {
             val currentTime = System.currentTimeMillis()
             
-            // Apply cooldown to prevent multiple triggers
-            if (currentTime - lastTriggerTime < COOLDOWN_MS) {
-                Log.d(TAG, "Cooldown active, skipping trigger")
+            // Apply cooldown to prevent redirect loops
+            if (currentTime - lastRedirectTime < COOLDOWN_MS) {
+                Log.d(TAG, "Cooldown active (${COOLDOWN_MS}ms), skipping redirect")
                 return
             }
             
-            lastTriggerTime = currentTime
-            onYouTubeDetected()
-        } else {
-            // Hide overlay when user leaves YouTube
-            overlayManager?.hideOverlay()
+            // Check if redirect is enabled in preferences
+            val isEnabled = prefs?.getBoolean(PREF_ENABLED, true) ?: true
+            if (!isEnabled) {
+                Log.d(TAG, "Redirect disabled in preferences")
+                return
+            }
+            
+            lastRedirectTime = currentTime
+            redirectToWatchLater()
         }
     }
 
-    private fun onYouTubeDetected() {
-        Log.d(TAG, "YouTube detected! Showing overlay...")
+    private fun redirectToWatchLater() {
+        Log.d(TAG, "YouTube detected! Redirecting to Watch Later...")
         
-        // Phase 1: Show overlay popup
-        overlayManager?.showOverlay()
-        
-        // Phase 2 (TODO): Redirect to Watch Later
-        // val watchLaterUrl = "https://www.youtube.com/playlist?list=WL"
-        // val intent = Intent(Intent.ACTION_VIEW, Uri.parse(watchLaterUrl))
-        // intent.setPackage(YOUTUBE_PACKAGE)
-        // intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        // startActivity(intent)
+        try {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(WATCH_LATER_URL))
+            intent.setPackage(YOUTUBE_PACKAGE)
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            startActivity(intent)
+            Log.d(TAG, "Redirect intent sent successfully")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to redirect to Watch Later", e)
+        }
     }
 
     override fun onInterrupt() {
@@ -81,8 +92,7 @@ class YouTubeDetectorService : AccessibilityService() {
     override fun onDestroy() {
         super.onDestroy()
         isServiceEnabled = false
-        overlayManager?.hideOverlay()
-        overlayManager = null
+        prefs = null
         Log.d(TAG, "Service destroyed")
     }
 }

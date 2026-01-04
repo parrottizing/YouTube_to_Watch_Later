@@ -2,9 +2,7 @@
     <string name="app_name">YouTube to Watch Later</string>
     <string name="accessibility_service_description">Detects when YouTube app is opened to redirect you to your Watch Later playlist instead of the main feed.</string>
     <string name="enable_accessibility">Enable Accessibility Service</string>
-    <string name="enable_overlay">Enable Overlay Permission</string>
     <string name="status_enabled">✓ Enabled</string>
     <string name="status_disabled">✗ Disabled</string>
-    <string name="youtube_detected">YouTube Detected!</string>
-    <string name="instructions">This app redirects you to Watch Later when you open YouTube.\n\nPlease enable both permissions below:</string>
+    <string name="instructions">Escape the YouTube feed!\n\nEnable the service below to automatically go to Watch Later when you open YouTube.</string>
 </resources>

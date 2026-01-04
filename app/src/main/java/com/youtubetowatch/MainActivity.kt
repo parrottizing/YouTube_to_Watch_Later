@@ -1,43 +1,52 @@
 package com.youtubetowatch
 
 import android.content.Intent
+import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.widget.Button
+import android.widget.Switch
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 
 /**
- * Main activity that guides users to enable required permissions:
- * 1. Accessibility Service - for detecting YouTube
- * 2. Overlay Permission - for showing the popup
+ * Main activity that guides users to enable required permissions
+ * and provides a toggle to enable/disable the redirect.
  */
 class MainActivity : AppCompatActivity() {
 
+    companion object {
+        private const val PREFS_NAME = "youtube_redirect_prefs"
+        private const val PREF_ENABLED = "redirect_enabled"
+    }
+
     private lateinit var accessibilityStatusText: TextView
-    private lateinit var overlayStatusText: TextView
     private lateinit var enableAccessibilityButton: Button
-    private lateinit var enableOverlayButton: Button
+    private lateinit var redirectToggle: Switch
+    private lateinit var prefs: SharedPreferences
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+
         // Initialize views
         accessibilityStatusText = findViewById(R.id.accessibility_status)
-        overlayStatusText = findViewById(R.id.overlay_status)
         enableAccessibilityButton = findViewById(R.id.btn_enable_accessibility)
-        enableOverlayButton = findViewById(R.id.btn_enable_overlay)
+        redirectToggle = findViewById(R.id.redirect_toggle)
 
         // Set up button click listeners
         enableAccessibilityButton.setOnClickListener {
             openAccessibilitySettings()
         }
 
-        enableOverlayButton.setOnClickListener {
-            openOverlaySettings()
+        // Set up toggle listener
+        redirectToggle.isChecked = prefs.getBoolean(PREF_ENABLED, true)
+        redirectToggle.setOnCheckedChangeListener { _, isChecked ->
+            prefs.edit().putBoolean(PREF_ENABLED, isChecked).apply()
         }
     }
 
@@ -57,17 +66,9 @@ class MainActivity : AppCompatActivity() {
         accessibilityStatusText.setTextColor(
             getColor(if (isAccessibilityEnabled) R.color.success_green else R.color.error_red)
         )
-
-        // Check Overlay Permission status
-        val isOverlayEnabled = canDrawOverlay()
-        overlayStatusText.text = if (isOverlayEnabled) {
-            getString(R.string.status_enabled)
-        } else {
-            getString(R.string.status_disabled)
-        }
-        overlayStatusText.setTextColor(
-            getColor(if (isOverlayEnabled) R.color.success_green else R.color.error_red)
-        )
+        
+        // Update toggle enabled state based on accessibility service
+        redirectToggle.isEnabled = isAccessibilityEnabled
     }
 
     private fun isAccessibilityServiceEnabled(): Boolean {
@@ -81,26 +82,8 @@ class MainActivity : AppCompatActivity() {
                enabledServices.contains(YouTubeDetectorService::class.java.canonicalName ?: "")
     }
 
-    private fun canDrawOverlay(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            Settings.canDrawOverlays(this)
-        } else {
-            true
-        }
-    }
-
     private fun openAccessibilitySettings() {
         val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
         startActivity(intent)
-    }
-
-    private fun openOverlaySettings() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val intent = Intent(
-                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                Uri.parse("package:$packageName")
-            )
-            startActivity(intent)
-        }
     }
 }
