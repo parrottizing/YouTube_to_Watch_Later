@@ -31,6 +31,7 @@ class YouTubeDetectorService : AccessibilityService() {
 
     private var lastRedirectTime = 0L
     private var prefs: SharedPreferences? = null
+    private var lastPackageName: String? = null  // Track the previous app
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -47,15 +48,16 @@ class YouTubeDetectorService : AccessibilityService() {
         
         val packageName = event.packageName?.toString() ?: return
         
-        Log.d(TAG, "Window changed to: $packageName")
+        Log.d(TAG, "Window changed to: $packageName (previous: $lastPackageName)")
         
-        // Check if YouTube was opened
-        if (packageName == YOUTUBE_PACKAGE) {
+        // Check if YouTube was opened FROM A DIFFERENT APP (not navigation within YouTube)
+        if (packageName == YOUTUBE_PACKAGE && lastPackageName != YOUTUBE_PACKAGE) {
             val currentTime = System.currentTimeMillis()
             
             // Apply cooldown to prevent redirect loops
             if (currentTime - lastRedirectTime < COOLDOWN_MS) {
                 Log.d(TAG, "Cooldown active (${COOLDOWN_MS}ms), skipping redirect")
+                lastPackageName = packageName
                 return
             }
             
@@ -63,12 +65,16 @@ class YouTubeDetectorService : AccessibilityService() {
             val isEnabled = prefs?.getBoolean(PREF_ENABLED, true) ?: true
             if (!isEnabled) {
                 Log.d(TAG, "Redirect disabled in preferences")
+                lastPackageName = packageName
                 return
             }
             
             lastRedirectTime = currentTime
             redirectToWatchLater()
         }
+        
+        // Always update the last package name
+        lastPackageName = packageName
     }
 
     private fun redirectToWatchLater() {
