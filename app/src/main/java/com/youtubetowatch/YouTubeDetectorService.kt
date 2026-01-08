@@ -6,9 +6,11 @@ import android.content.SharedPreferences
 import android.net.Uri
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import java.util.LinkedList
 
 /**
- * Accessibility Service that detects when YouTube app is opened
+ * Accessibility Service that detects when YouTube Home screen is active
  * and redirects to the Watch Later playlist.
  */
 class YouTubeDetectorService : AccessibilityService() {
@@ -31,7 +33,6 @@ class YouTubeDetectorService : AccessibilityService() {
 
     private var lastRedirectTime = 0L
     private var prefs: SharedPreferences? = null
-    private var lastPackageName: String? = null  // Track the previous app
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -43,42 +44,104 @@ class YouTubeDetectorService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
         
-        // Only process window state changes
-        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+        // Only process window state changes and content changes
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            event.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) return
         
         val packageName = event.packageName?.toString() ?: return
         
-        Log.d(TAG, "Window changed to: $packageName (previous: $lastPackageName)")
+        // Only care about YouTube events
+        if (packageName != YOUTUBE_PACKAGE) return
         
-        // Check if YouTube was opened FROM A DIFFERENT APP (not navigation within YouTube)
-        if (packageName == YOUTUBE_PACKAGE && lastPackageName != YOUTUBE_PACKAGE) {
-            val currentTime = System.currentTimeMillis()
-            
-            // Apply cooldown to prevent redirect loops
-            if (currentTime - lastRedirectTime < COOLDOWN_MS) {
-                Log.d(TAG, "Cooldown active (${COOLDOWN_MS}ms), skipping redirect")
-                lastPackageName = packageName
-                return
-            }
-            
-            // Check if redirect is enabled in preferences
-            val isEnabled = prefs?.getBoolean(PREF_ENABLED, true) ?: true
-            if (!isEnabled) {
-                Log.d(TAG, "Redirect disabled in preferences")
-                lastPackageName = packageName
-                return
-            }
-            
+        Log.d(TAG, "YouTube event: ${event.eventType}")
+        
+        // Check if redirect is enabled in preferences
+        val isEnabled = prefs?.getBoolean(PREF_ENABLED, true) ?: true
+        if (!isEnabled) {
+            Log.d(TAG, "Redirect disabled in preferences")
+            return
+        }
+        
+        // Check cooldown
+        val currentTime = System.currentTimeMillis()
+        if (currentTime - lastRedirectTime < COOLDOWN_MS) {
+            Log.d(TAG, "Cooldown active, skipping check")
+            return
+        }
+        
+        // Check if we are on the Home screen
+        if (isOnHomeScreen()) {
+            Log.d(TAG, "Home screen detected!")
             lastRedirectTime = currentTime
             redirectToWatchLater()
         }
+    }
+
+    /**
+     * Check if the YouTube "Home" tab is currently selected.
+     * This traverses the accessibility node tree looking for a node with
+     * contentDescription containing "Home" that is selected.
+     */
+    private fun isOnHomeScreen(): Boolean {
+        val rootNode = rootInActiveWindow ?: run {
+            Log.d(TAG, "Root window not available")
+            return false
+        }
         
-        // Always update the last package name
-        lastPackageName = packageName
+        try {
+            // BFS to find the Home tab
+            val queue = LinkedList<AccessibilityNodeInfo>()
+            queue.add(rootNode)
+            
+            while (queue.isNotEmpty()) {
+                val node = queue.poll() ?: continue
+                
+                val contentDesc = node.contentDescription?.toString() ?: ""
+                val text = node.text?.toString() ?: ""
+                
+                // Look for "Home" tab that is selected
+                // YouTube uses "Home" as content description for the bottom nav button
+                if ((contentDesc.equals("Home", ignoreCase = true) || 
+                     text.equals("Home", ignoreCase = true)) && 
+                    node.isSelected) {
+                    Log.d(TAG, "Found selected Home tab: desc='$contentDesc', text='$text', selected=${node.isSelected}")
+                    node.recycle()
+                    recycleNodes(queue)
+                    rootNode.recycle()
+                    return true
+                }
+                
+                // Add children to queue
+                for (i in 0 until node.childCount) {
+                    val child = node.getChild(i)
+                    if (child != null) {
+                        queue.add(child)
+                    }
+                }
+                
+                node.recycle()
+            }
+            
+            rootNode.recycle()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking home screen", e)
+        }
+        
+        return false
+    }
+    
+    private fun recycleNodes(nodes: Collection<AccessibilityNodeInfo>) {
+        for (node in nodes) {
+            try {
+                node.recycle()
+            } catch (e: Exception) {
+                // Ignore
+            }
+        }
     }
 
     private fun redirectToWatchLater() {
-        Log.d(TAG, "YouTube detected! Redirecting to Watch Later...")
+        Log.d(TAG, "Redirecting to Watch Later...")
         
         try {
             val intent = Intent(Intent.ACTION_VIEW, Uri.parse(WATCH_LATER_URL))
