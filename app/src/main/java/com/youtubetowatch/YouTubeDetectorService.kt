@@ -69,12 +69,64 @@ class YouTubeDetectorService : AccessibilityService() {
             return
         }
         
+        // Check if already on Watch Later - don't redirect if we're already there
+        if (isOnWatchLaterPlaylist()) {
+            Log.d(TAG, "Already on Watch Later playlist, skipping redirect")
+            return
+        }
+        
         // Check if we are on the Home screen
         if (isOnHomeScreen()) {
             Log.d(TAG, "Home screen detected!")
             lastRedirectTime = currentTime
             redirectToWatchLater()
         }
+    }
+    
+    /**
+     * Check if we are currently viewing the Watch Later playlist.
+     * Looks for "Watch later" or "Watch Later" text in the UI.
+     */
+    private fun isOnWatchLaterPlaylist(): Boolean {
+        val rootNode = rootInActiveWindow ?: return false
+        
+        try {
+            val queue = LinkedList<AccessibilityNodeInfo>()
+            queue.add(rootNode)
+            
+            while (queue.isNotEmpty()) {
+                val node = queue.poll() ?: continue
+                
+                val contentDesc = node.contentDescription?.toString() ?: ""
+                val text = node.text?.toString() ?: ""
+                
+                // Look for "Watch later" or "Watch Later" which indicates we're on that playlist
+                if (contentDesc.contains("Watch later", ignoreCase = true) || 
+                    text.contains("Watch later", ignoreCase = true)) {
+                    Log.d(TAG, "Found Watch Later indicator: desc='$contentDesc', text='$text'")
+                    node.recycle()
+                    recycleNodes(queue)
+                    rootNode.recycle()
+                    return true
+                }
+                
+                // Add children to queue
+                for (i in 0 until node.childCount) {
+                    val child = node.getChild(i)
+                    if (child != null) {
+                        queue.add(child)
+                    }
+                }
+                
+                node.recycle()
+            }
+            
+            rootNode.recycle()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking Watch Later playlist", e)
+        }
+        
+        return false
     }
 
     /**
