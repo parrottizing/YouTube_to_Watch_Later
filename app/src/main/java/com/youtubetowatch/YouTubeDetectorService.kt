@@ -4,6 +4,9 @@ import android.accessibilityservice.AccessibilityService
 import android.content.Intent
 import android.content.SharedPreferences
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -22,6 +25,13 @@ class YouTubeDetectorService : AccessibilityService() {
         
         // Cooldown to prevent redirect loops (5 seconds)
         private const val COOLDOWN_MS = 5000L
+
+        // Debounce and scan limits to avoid hammering YouTube's UI thread
+        private const val EVENT_DEBOUNCE_MS = 400L
+        private const val MIN_SCAN_INTERVAL_MS = 1000L
+        private const val REDIRECT_IN_FLIGHT_MS = 8000L
+        private const val MAX_SCAN_NODES = 2000
+        private const val MAX_SCAN_MS = 120L
         
         // Preference keys
         private const val PREFS_NAME = "youtube_redirect_prefs"
@@ -31,7 +41,12 @@ class YouTubeDetectorService : AccessibilityService() {
             private set
     }
 
-    private var lastRedirectTime = 0L
+    private var lastRedirectUptimeMs = 0L
+    private var lastScanUptimeMs = 0L
+    private var redirectInFlightUntilMs = 0L
+    private var lastWindowId = -1
+    private var pendingScan: Runnable? = null
+    private val handler = Handler(Looper.getMainLooper())
     private var prefs: SharedPreferences? = null
 
     override fun onServiceConnected() {
@@ -44,9 +59,8 @@ class YouTubeDetectorService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
         
-        // Only process window state changes and content changes
-        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
-            event.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) return
+        // Only process window state changes
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
         
         val packageName = event.packageName?.toString() ?: return
         
@@ -61,125 +75,129 @@ class YouTubeDetectorService : AccessibilityService() {
             Log.d(TAG, "Redirect disabled in preferences")
             return
         }
-        
-        // Check cooldown
-        val currentTime = System.currentTimeMillis()
-        if (currentTime - lastRedirectTime < COOLDOWN_MS) {
-            Log.d(TAG, "Cooldown active, skipping check")
+
+        val now = SystemClock.uptimeMillis()
+        if (now < redirectInFlightUntilMs) {
+            Log.d(TAG, "Redirect in flight, skipping scan")
             return
         }
-        
-        // Check if already on Watch Later - don't redirect if we're already there
-        if (isOnWatchLaterPlaylist()) {
+
+        // Debounce repeated window events
+        scheduleScan(event.windowId)
+    }
+    
+    private fun scheduleScan(windowId: Int) {
+        pendingScan?.let { handler.removeCallbacks(it) }
+        pendingScan = Runnable {
+            pendingScan = null
+            performScan(windowId)
+        }
+        handler.postDelayed(pendingScan!!, EVENT_DEBOUNCE_MS)
+    }
+
+    private fun performScan(windowId: Int) {
+        val now = SystemClock.uptimeMillis()
+        if (now < redirectInFlightUntilMs) {
+            Log.d(TAG, "Redirect in flight, skipping scan")
+            return
+        }
+
+        if (now - lastScanUptimeMs < MIN_SCAN_INTERVAL_MS && windowId == lastWindowId) {
+            Log.d(TAG, "Scan throttled (windowId=$windowId)")
+            return
+        }
+        lastScanUptimeMs = now
+        lastWindowId = windowId
+
+        if (now - lastRedirectUptimeMs < COOLDOWN_MS) {
+            Log.d(TAG, "Cooldown active, skipping scan")
+            return
+        }
+
+        val scanResult = scanUi()
+        if (scanResult.onWatchLater) {
             Log.d(TAG, "Already on Watch Later playlist, skipping redirect")
             return
         }
-        
-        // Check if we are on the Home screen
-        if (isOnHomeScreen()) {
+
+        if (scanResult.onHomeSelected) {
             Log.d(TAG, "Home screen detected!")
-            lastRedirectTime = currentTime
+            lastRedirectUptimeMs = now
+            redirectInFlightUntilMs = now + REDIRECT_IN_FLIGHT_MS
             redirectToWatchLater()
         }
     }
-    
-    /**
-     * Check if we are currently viewing the Watch Later playlist.
-     * Looks for "Watch later" or "Watch Later" text in the UI.
-     */
-    private fun isOnWatchLaterPlaylist(): Boolean {
-        val rootNode = rootInActiveWindow ?: return false
-        
-        try {
-            val queue = LinkedList<AccessibilityNodeInfo>()
-            queue.add(rootNode)
-            
-            while (queue.isNotEmpty()) {
-                val node = queue.poll() ?: continue
-                
-                val contentDesc = node.contentDescription?.toString() ?: ""
-                val text = node.text?.toString() ?: ""
-                
-                // Look for "Watch later" or "Watch Later" which indicates we're on that playlist
-                if (contentDesc.contains("Watch later", ignoreCase = true) || 
-                    text.contains("Watch later", ignoreCase = true)) {
-                    Log.d(TAG, "Found Watch Later indicator: desc='$contentDesc', text='$text'")
-                    node.recycle()
-                    recycleNodes(queue)
-                    rootNode.recycle()
-                    return true
-                }
-                
-                // Add children to queue
-                for (i in 0 until node.childCount) {
-                    val child = node.getChild(i)
-                    if (child != null) {
-                        queue.add(child)
-                    }
-                }
-                
-                node.recycle()
-            }
-            
-            rootNode.recycle()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error checking Watch Later playlist", e)
-        }
-        
-        return false
-    }
+
+    private data class ScanResult(
+        val onWatchLater: Boolean,
+        val onHomeSelected: Boolean
+    )
 
     /**
-     * Check if the YouTube "Home" tab is currently selected.
-     * This traverses the accessibility node tree looking for a node with
-     * contentDescription containing "Home" that is selected.
+     * Single-pass scan that checks both "Watch later" and selected "Home" tab.
+     * This is time- and node-limited to avoid slowing down YouTube.
      */
-    private fun isOnHomeScreen(): Boolean {
+    private fun scanUi(): ScanResult {
         val rootNode = rootInActiveWindow ?: run {
             Log.d(TAG, "Root window not available")
-            return false
+            return ScanResult(false, false)
         }
-        
+
+        var foundWatchLater = false
+        var foundHomeSelected = false
+        var nodesScanned = 0
+        val start = SystemClock.uptimeMillis()
+        val queue = LinkedList<AccessibilityNodeInfo>()
+        queue.add(rootNode)
+
         try {
-            // BFS to find the Home tab
-            val queue = LinkedList<AccessibilityNodeInfo>()
-            queue.add(rootNode)
-            
             while (queue.isNotEmpty()) {
                 val node = queue.poll() ?: continue
-                
-                val contentDesc = node.contentDescription?.toString() ?: ""
-                val text = node.text?.toString() ?: ""
-                
-                // Look for "Home" tab that is selected
-                // YouTube uses "Home" as content description for the bottom nav button
-                if ((contentDesc.equals("Home", ignoreCase = true) || 
-                     text.equals("Home", ignoreCase = true)) && 
-                    node.isSelected) {
-                    Log.d(TAG, "Found selected Home tab: desc='$contentDesc', text='$text', selected=${node.isSelected}")
-                    node.recycle()
-                    recycleNodes(queue)
-                    rootNode.recycle()
-                    return true
-                }
-                
-                // Add children to queue
-                for (i in 0 until node.childCount) {
-                    val child = node.getChild(i)
-                    if (child != null) {
-                        queue.add(child)
+                try {
+                    nodesScanned++
+                    val contentDesc = node.contentDescription?.toString() ?: ""
+                    val text = node.text?.toString() ?: ""
+
+                    if (!foundWatchLater &&
+                        (contentDesc.contains("Watch later", ignoreCase = true) ||
+                         text.contains("Watch later", ignoreCase = true))) {
+                        Log.d(TAG, "Found Watch Later indicator: desc='$contentDesc', text='$text'")
+                        foundWatchLater = true
+                        break
                     }
+
+                    if (!foundHomeSelected &&
+                        node.isSelected &&
+                        (contentDesc.equals("Home", ignoreCase = true) ||
+                         text.equals("Home", ignoreCase = true))) {
+                        Log.d(TAG, "Found selected Home tab: desc='$contentDesc', text='$text', selected=${node.isSelected}")
+                        foundHomeSelected = true
+                        // Keep scanning briefly for Watch Later to avoid false redirects
+                    }
+
+                    if (nodesScanned >= MAX_SCAN_NODES ||
+                        SystemClock.uptimeMillis() - start > MAX_SCAN_MS) {
+                        Log.d(TAG, "Scan budget exceeded: nodes=$nodesScanned")
+                        break
+                    }
+
+                    for (i in 0 until node.childCount) {
+                        val child = node.getChild(i)
+                        if (child != null) {
+                            queue.add(child)
+                        }
+                    }
+                } finally {
+                    node.recycle()
                 }
-                
-                node.recycle()
             }
-            
-            rootNode.recycle()
         } catch (e: Exception) {
-            Log.e(TAG, "Error checking home screen", e)
+            Log.e(TAG, "Error scanning UI", e)
+        } finally {
+            recycleNodes(queue)
         }
-        
-        return false
+
+        return ScanResult(foundWatchLater, foundHomeSelected)
     }
     
     private fun recycleNodes(nodes: Collection<AccessibilityNodeInfo>) {
@@ -198,7 +216,7 @@ class YouTubeDetectorService : AccessibilityService() {
         try {
             val intent = Intent(Intent.ACTION_VIEW, Uri.parse(WATCH_LATER_URL))
             intent.setPackage(YOUTUBE_PACKAGE)
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
             startActivity(intent)
             Log.d(TAG, "Redirect intent sent successfully")
         } catch (e: Exception) {
@@ -214,6 +232,8 @@ class YouTubeDetectorService : AccessibilityService() {
         super.onDestroy()
         isServiceEnabled = false
         prefs = null
+        pendingScan?.let { handler.removeCallbacks(it) }
+        pendingScan = null
         Log.d(TAG, "Service destroyed")
     }
 }
