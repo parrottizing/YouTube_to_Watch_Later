@@ -10,7 +10,7 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
-import java.util.LinkedList
+import java.util.ArrayDeque
 
 /**
  * Accessibility Service that detects when YouTube Home screen is active
@@ -28,16 +28,21 @@ class YouTubeDetectorService : AccessibilityService() {
 
         // Debounce and scan limits to avoid hammering YouTube's UI thread
         private const val EVENT_DEBOUNCE_MS = 400L
+        private const val HOME_INTERACTION_SCAN_DELAY_MS = 180L
+        private const val CONTENT_EVENT_DEBOUNCE_MS = 650L
         private const val MIN_SCAN_INTERVAL_MS = 1000L
         private const val HOME_CONFIRMATION_MS = 1200L
-        private const val DEEPLINK_SUPPRESSION_MS = 3500L
-        private const val REDIRECT_IN_FLIGHT_MS = 8000L
-        private const val MAX_SCAN_NODES = 2000
-        private const val MAX_SCAN_MS = 120L
+        private const val HOME_RECHECK_MS = 650L
+        private const val MAX_HOME_RECHECKS = 3
+        private const val DEEPLINK_SUPPRESSION_MS = 1800L
+        private const val REDIRECT_IN_FLIGHT_MS = 3200L
+        private const val MAX_SCAN_NODES = 5000
+        private const val MAX_SCAN_MS = 260L
+        private const val SHELL_HOME_ACTIVITY_HINT = "Shell\$HomeActivity"
+        private const val HOME_ACTIVITY_FALLBACK_WINDOW_MS = 6000L
 
         private val NON_HOME_ACTIVITY_HINTS = arrayOf(
             "watchwhile.MainActivity",
-            "InternalMainActivity",
             "UrlActivity",
             "StandalonePlayerActivity"
         )
@@ -54,11 +59,17 @@ class YouTubeDetectorService : AccessibilityService() {
     private var lastScanUptimeMs = 0L
     private var redirectInFlightUntilMs = 0L
     private var lastNonHomeEventUptimeMs = 0L
+    private var currentActivityClassName: String? = null
     private var lastWindowId = -1
     private var lastWindowClassName: String? = null
     private var homeCandidateSinceUptimeMs = 0L
     private var homeCandidateWindowId = -1
     private var homeCandidateClassName: String? = null
+    private var homeRecheckWindowId = -1
+    private var homeRecheckClassName: String? = null
+    private var homeRecheckAttempt = 0
+    private var lastWindowStateUptimeMs = 0L
+    private var lastWindowStateClassName: String? = null
     private var pendingScan: Runnable? = null
     private val handler = Handler(Looper.getMainLooper())
     private var prefs: SharedPreferences? = null
@@ -72,26 +83,42 @@ class YouTubeDetectorService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
-        
-        // Only process window state changes
-        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
-        
+
         val packageName = event.packageName?.toString() ?: return
-        
+
         // Only care about YouTube events
         if (packageName != YOUTUBE_PACKAGE) return
 
-        val eventClassName = event.className?.toString().orEmpty()
+        val eventType = event.eventType
+        val isWindowStateEvent = eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+        val isContentChangedEvent = eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+        val isHomeInteraction = isHomeInteractionEvent(event)
+        if (!isWindowStateEvent && !isContentChangedEvent && !isHomeInteraction) return
+
+        val eventClassName = if (isWindowStateEvent) {
+            event.className?.toString().orEmpty()
+        } else if (isContentChangedEvent) {
+            currentActivityClassName ?: event.className?.toString().orEmpty()
+        } else {
+            currentActivityClassName.orEmpty()
+        }
         val now = SystemClock.uptimeMillis()
         Log.d(
             TAG,
-            "YouTube event: type=${event.eventType}, class=$eventClassName, windowId=${event.windowId}"
+            "YouTube event: type=$eventType, class=$eventClassName, windowId=${event.windowId}, homeInteraction=$isHomeInteraction, contentChanged=$isContentChangedEvent"
         )
 
-        if (isLikelyDeepLinkActivity(eventClassName)) {
-            lastNonHomeEventUptimeMs = now
-            resetHomeCandidate()
-            Log.d(TAG, "Deep-link/player activity seen ($eventClassName), temporarily suppressing redirect")
+        if (isWindowStateEvent) {
+            currentActivityClassName = eventClassName
+            lastWindowStateUptimeMs = now
+            lastWindowStateClassName = eventClassName
+
+            if (isLikelyDeepLinkActivity(eventClassName)) {
+                lastNonHomeEventUptimeMs = now
+                resetHomeCandidate()
+                resetHomeRecheck()
+                Log.d(TAG, "Deep-link/player activity seen ($eventClassName), temporarily suppressing redirect")
+            }
         }
 
         // Check if redirect is enabled in preferences
@@ -102,12 +129,19 @@ class YouTubeDetectorService : AccessibilityService() {
         }
 
         if (now < redirectInFlightUntilMs) {
-            Log.d(TAG, "Redirect in flight, skipping scan")
+            val remainingMs = redirectInFlightUntilMs - now
+            Log.d(TAG, "Redirect in flight (${remainingMs}ms remaining), deferring scan")
+            scheduleScan(event.windowId, eventClassName, remainingMs + 120L)
             return
         }
 
-        // Debounce repeated window events
-        scheduleScan(event.windowId, eventClassName)
+        // Use a tighter delay for direct Home interactions, debounce for window transitions.
+        val scanDelayMs = when {
+            isHomeInteraction -> HOME_INTERACTION_SCAN_DELAY_MS
+            isContentChangedEvent -> CONTENT_EVENT_DEBOUNCE_MS
+            else -> EVENT_DEBOUNCE_MS
+        }
+        scheduleScan(event.windowId, eventClassName, scanDelayMs)
     }
     
     private fun scheduleScan(
@@ -126,7 +160,9 @@ class YouTubeDetectorService : AccessibilityService() {
     private fun performScan(windowId: Int, eventClassName: String) {
         val now = SystemClock.uptimeMillis()
         if (now < redirectInFlightUntilMs) {
-            Log.d(TAG, "Redirect in flight, skipping scan")
+            val remainingMs = redirectInFlightUntilMs - now
+            Log.d(TAG, "Redirect in flight (${remainingMs}ms remaining), deferring scan")
+            scheduleScan(windowId, eventClassName, remainingMs + 120L)
             return
         }
 
@@ -141,15 +177,10 @@ class YouTubeDetectorService : AccessibilityService() {
         lastWindowId = windowId
         lastWindowClassName = eventClassName
 
-        if (isLikelyDeepLinkActivity(eventClassName)) {
-            resetHomeCandidate()
-            Log.d(TAG, "Scan skipped for deep-link/player class ($eventClassName)")
-            return
-        }
-
         val suppressionRemainingMs = lastNonHomeEventUptimeMs + DEEPLINK_SUPPRESSION_MS - now
         if (suppressionRemainingMs > 0) {
             resetHomeCandidate()
+            resetHomeRecheck()
             Log.d(
                 TAG,
                 "Deep-link suppression active for ${suppressionRemainingMs}ms; delaying Home confirmation scan"
@@ -159,6 +190,7 @@ class YouTubeDetectorService : AccessibilityService() {
         }
 
         if (now - lastRedirectUptimeMs < COOLDOWN_MS) {
+            resetHomeRecheck()
             Log.d(TAG, "Cooldown active, skipping scan")
             return
         }
@@ -166,16 +198,29 @@ class YouTubeDetectorService : AccessibilityService() {
         val scanResult = scanUi()
         if (scanResult.onWatchLater) {
             resetHomeCandidate()
+            resetHomeRecheck()
             Log.d(TAG, "Already on Watch Later playlist, skipping redirect")
             return
         }
 
         if (!scanResult.onHomeSelected) {
             resetHomeCandidate()
+            if (scheduleHomeRecheck(windowId, eventClassName)) {
+                return
+            }
+            if (shouldFallbackRedirectFromHomeActivity(now)) {
+                resetHomeRecheck()
+                Log.d(TAG, "Home markers missing but recent HomeActivity detected, redirecting aggressively")
+                lastRedirectUptimeMs = now
+                redirectInFlightUntilMs = now + REDIRECT_IN_FLIGHT_MS
+                redirectToWatchLater()
+                return
+            }
             Log.d(TAG, "Home tab is not selected, skipping redirect")
             return
         }
 
+        resetHomeRecheck()
         if (!isHomeConfirmed(now, windowId, eventClassName)) {
             scheduleScan(windowId, eventClassName, HOME_CONFIRMATION_MS)
             return
@@ -204,24 +249,41 @@ class YouTubeDetectorService : AccessibilityService() {
         }
 
         var foundWatchLater = false
+        var foundWatchLaterTitle = false
+        var foundWatchLaterPlaylistContext = false
         var foundHomeSelected = false
         var nodesScanned = 0
         val start = SystemClock.uptimeMillis()
-        val queue = LinkedList<AccessibilityNodeInfo>()
-        queue.add(rootNode)
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.addLast(rootNode)
 
         try {
-            while (queue.isNotEmpty()) {
-                val node = queue.poll() ?: continue
+            while (stack.isNotEmpty()) {
+                val node = stack.removeLast()
                 try {
                     nodesScanned++
                     val contentDesc = node.contentDescription?.toString() ?: ""
                     val text = node.text?.toString() ?: ""
 
+                    if (!foundWatchLaterTitle &&
+                        (contentDesc.equals("Watch later", ignoreCase = true) ||
+                         text.equals("Watch later", ignoreCase = true))) {
+                        foundWatchLaterTitle = true
+                    }
+
+                    if (!foundWatchLaterPlaylistContext &&
+                        (contentDesc.contains("Play all", ignoreCase = true) ||
+                         text.equals("Playlist", ignoreCase = true))) {
+                        foundWatchLaterPlaylistContext = true
+                    }
+
                     if (!foundWatchLater &&
-                        (contentDesc.contains("Watch later", ignoreCase = true) ||
-                         text.contains("Watch later", ignoreCase = true))) {
-                        Log.d(TAG, "Found Watch Later indicator: desc='$contentDesc', text='$text'")
+                        foundWatchLaterTitle &&
+                        foundWatchLaterPlaylistContext) {
+                        Log.d(
+                            TAG,
+                            "Confirmed Watch Later playlist context (title+playlist markers)"
+                        )
                         foundWatchLater = true
                         break
                     }
@@ -241,10 +303,10 @@ class YouTubeDetectorService : AccessibilityService() {
                         break
                     }
 
-                    for (i in 0 until node.childCount) {
+                    for (i in node.childCount - 1 downTo 0) {
                         val child = node.getChild(i)
                         if (child != null) {
-                            queue.add(child)
+                            stack.addLast(child)
                         }
                     }
                 } finally {
@@ -254,7 +316,7 @@ class YouTubeDetectorService : AccessibilityService() {
         } catch (e: Exception) {
             Log.e(TAG, "Error scanning UI", e)
         } finally {
-            recycleNodes(queue)
+            recycleNodes(stack)
         }
 
         return ScanResult(foundWatchLater, foundHomeSelected)
@@ -265,6 +327,64 @@ class YouTubeDetectorService : AccessibilityService() {
             return false
         }
         return NON_HOME_ACTIVITY_HINTS.any { className.contains(it, ignoreCase = true) }
+    }
+
+    private fun isHomeInteractionEvent(event: AccessibilityEvent): Boolean {
+        if (event.eventType != AccessibilityEvent.TYPE_VIEW_CLICKED &&
+            event.eventType != AccessibilityEvent.TYPE_VIEW_SELECTED
+        ) {
+            return false
+        }
+
+        if (event.contentDescription?.toString()?.equals("Home", ignoreCase = true) == true) {
+            return true
+        }
+
+        if (event.text.any { it?.toString()?.equals("Home", ignoreCase = true) == true }) {
+            return true
+        }
+
+        val source = event.source ?: return false
+        return try {
+            source.contentDescription?.toString()?.equals("Home", ignoreCase = true) == true ||
+                source.text?.toString()?.equals("Home", ignoreCase = true) == true
+        } catch (e: Exception) {
+            false
+        } finally {
+            source.recycle()
+        }
+    }
+
+    private fun scheduleHomeRecheck(windowId: Int, eventClassName: String): Boolean {
+        val sameTarget = homeRecheckWindowId == windowId && homeRecheckClassName == eventClassName
+        if (!sameTarget) {
+            homeRecheckWindowId = windowId
+            homeRecheckClassName = eventClassName
+            homeRecheckAttempt = 0
+        }
+
+        if (homeRecheckAttempt >= MAX_HOME_RECHECKS) {
+            resetHomeRecheck()
+            return false
+        }
+
+        homeRecheckAttempt++
+        Log.d(TAG, "Home not selected yet, scheduling recheck $homeRecheckAttempt/$MAX_HOME_RECHECKS")
+        scheduleScan(windowId, eventClassName, HOME_RECHECK_MS)
+        return true
+    }
+
+    private fun shouldFallbackRedirectFromHomeActivity(now: Long): Boolean {
+        if (lastWindowStateClassName?.contains(SHELL_HOME_ACTIVITY_HINT, ignoreCase = true) != true) {
+            return false
+        }
+        return now - lastWindowStateUptimeMs <= HOME_ACTIVITY_FALLBACK_WINDOW_MS
+    }
+
+    private fun resetHomeRecheck() {
+        homeRecheckWindowId = -1
+        homeRecheckClassName = null
+        homeRecheckAttempt = 0
     }
 
     private fun isHomeConfirmed(now: Long, windowId: Int, eventClassName: String): Boolean {
@@ -327,7 +447,11 @@ class YouTubeDetectorService : AccessibilityService() {
         super.onDestroy()
         isServiceEnabled = false
         prefs = null
+        currentActivityClassName = null
+        lastWindowStateUptimeMs = 0L
+        lastWindowStateClassName = null
         resetHomeCandidate()
+        resetHomeRecheck()
         pendingScan?.let { handler.removeCallbacks(it) }
         pendingScan = null
         Log.d(TAG, "Service destroyed")
