@@ -24,20 +24,21 @@ class YouTubeDetectorService : AccessibilityService() {
         private const val WATCH_LATER_URL = "https://www.youtube.com/playlist?list=WL"
         
         // Cooldown to prevent redirect loops (5 seconds)
-        private const val COOLDOWN_MS = 5000L
+        private const val COOLDOWN_MS = 1800L
 
         // Debounce and scan limits to avoid hammering YouTube's UI thread
-        private const val EVENT_DEBOUNCE_MS = 400L
+        private const val EVENT_DEBOUNCE_MS = 220L
         private const val HOME_INTERACTION_SCAN_DELAY_MS = 180L
-        private const val CONTENT_EVENT_DEBOUNCE_MS = 650L
-        private const val MIN_SCAN_INTERVAL_MS = 1000L
-        private const val HOME_CONFIRMATION_MS = 1200L
-        private const val HOME_RECHECK_MS = 650L
+        private const val CONTENT_EVENT_DEBOUNCE_MS = 280L
+        private const val MIN_SCAN_INTERVAL_MS = 300L
+        private const val HOME_CONFIRMATION_MS = 650L
+        private const val HOME_RECHECK_MS = 350L
         private const val MAX_HOME_RECHECKS = 3
-        private const val DEEPLINK_SUPPRESSION_MS = 1800L
-        private const val REDIRECT_IN_FLIGHT_MS = 3200L
+        private const val DEEPLINK_SUPPRESSION_MS = 900L
+        private const val REDIRECT_IN_FLIGHT_MS = 2400L
         private const val MAX_SCAN_NODES = 5000
         private const val MAX_SCAN_MS = 260L
+        private const val HOME_INTERACTION_BYPASS_WINDOW_MS = 1200L
         private const val SHELL_HOME_ACTIVITY_HINT = "Shell\$HomeActivity"
         private const val HOME_ACTIVITY_FALLBACK_WINDOW_MS = 6000L
 
@@ -68,6 +69,7 @@ class YouTubeDetectorService : AccessibilityService() {
     private var homeRecheckWindowId = -1
     private var homeRecheckClassName: String? = null
     private var homeRecheckAttempt = 0
+    private var lastHomeInteractionUptimeMs = 0L
     private var lastWindowStateUptimeMs = 0L
     private var lastWindowStateClassName: String? = null
     private var pendingScan: Runnable? = null
@@ -119,6 +121,9 @@ class YouTubeDetectorService : AccessibilityService() {
                 resetHomeRecheck()
                 Log.d(TAG, "Deep-link/player activity seen ($eventClassName), temporarily suppressing redirect")
             }
+        }
+        if (isHomeInteraction) {
+            lastHomeInteractionUptimeMs = now
         }
 
         // Check if redirect is enabled in preferences
@@ -221,6 +226,14 @@ class YouTubeDetectorService : AccessibilityService() {
         }
 
         resetHomeRecheck()
+        if (shouldBypassHomeConfirmation(now)) {
+            resetHomeCandidate()
+            Log.d(TAG, "Recent explicit Home interaction detected, redirecting immediately")
+            lastRedirectUptimeMs = now
+            redirectInFlightUntilMs = now + REDIRECT_IN_FLIGHT_MS
+            redirectToWatchLater()
+            return
+        }
         if (!isHomeConfirmed(now, windowId, eventClassName)) {
             scheduleScan(windowId, eventClassName, HOME_CONFIRMATION_MS)
             return
@@ -381,6 +394,10 @@ class YouTubeDetectorService : AccessibilityService() {
         return now - lastWindowStateUptimeMs <= HOME_ACTIVITY_FALLBACK_WINDOW_MS
     }
 
+    private fun shouldBypassHomeConfirmation(now: Long): Boolean {
+        return now - lastHomeInteractionUptimeMs <= HOME_INTERACTION_BYPASS_WINDOW_MS
+    }
+
     private fun resetHomeRecheck() {
         homeRecheckWindowId = -1
         homeRecheckClassName = null
@@ -448,6 +465,7 @@ class YouTubeDetectorService : AccessibilityService() {
         isServiceEnabled = false
         prefs = null
         currentActivityClassName = null
+        lastHomeInteractionUptimeMs = 0L
         lastWindowStateUptimeMs = 0L
         lastWindowStateClassName = null
         resetHomeCandidate()
